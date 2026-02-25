@@ -1,40 +1,8 @@
 from flask import Flask, jsonify, request
-import requests
+import yfinance as yf
+from datetime import datetime, timezone
 
 app = Flask(__name__)
-
-YAHOO_BASE = "https://query1.finance.yahoo.com/v8/finance/chart/"
-
-# Realistic browser headers
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-GB,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-def get_yahoo_crumb():
-    """
-    Yahoo Finance requires a crumb token alongside requests.
-    We fetch the finance homepage first to get a session cookie and crumb.
-    """
-    session = requests.Session()
-    session.get("https://fc.yahoo.com", headers=HEADERS, timeout=10)
-    resp = session.get("https://query1.finance.yahoo.com/v1/test/getcrumb", headers=HEADERS, timeout=10)
-    crumb = resp.text.strip()
-    return session, crumb
-
-# Cache the session and crumb so we don't re-fetch on every request
-_session = None
-_crumb   = None
-
-def get_session_and_crumb():
-    global _session, _crumb
-    if not _session or not _crumb or len(_crumb) < 2:
-        _session, _crumb = get_yahoo_crumb()
-    return _session, _crumb
 
 @app.route("/price")
 def price():
@@ -47,20 +15,31 @@ def price():
         return jsonify({"error": "Missing required parameters"}), 400
 
     try:
-        session, crumb = get_session_and_crumb()
-        url = f"{YAHOO_BASE}{ticker}?period1={period1}&period2={period2}&interval={interval}&crumb={crumb}"
-        resp = session.get(url, headers=HEADERS, timeout=15)
+        start = datetime.fromtimestamp(int(period1), tz=timezone.utc).strftime("%Y-%m-%d")
+        end   = datetime.fromtimestamp(int(period2), tz=timezone.utc).strftime("%Y-%m-%d")
 
-        # If crumb has expired, refresh and retry once
-        if resp.status_code in (401, 403):
-            global _session, _crumb
-            _session, _crumb = get_yahoo_crumb()
-            url = f"{YAHOO_BASE}{ticker}?period1={period1}&period2={period2}&interval={interval}&crumb={_crumb}"
-            resp = _session.get(url, headers=HEADERS, timeout=15)
+        t    = yf.Ticker(ticker)
+        hist = t.history(start=start, end=end, interval=interval, auto_adjust=True)
 
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.RequestException as e:
+        if hist.empty:
+            return jsonify({"error": f"No data returned for {ticker}"}), 404
+
+        timestamps = [int(d.timestamp()) for d in hist.index]
+        closes     = [round(float(c), 6) for c in hist["Close"]]
+
+        # Return in the same shape the frontend already expects
+        data = {
+            "chart": {
+                "result": [{
+                    "timestamp": timestamps,
+                    "indicators": {
+                        "quote": [{"close": closes}]
+                    }
+                }]
+            }
+        }
+
+    except Exception as e:
         return jsonify({"error": str(e)}), 502
 
     response = jsonify(data)
